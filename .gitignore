@@ -4,6 +4,10 @@
 
 ## User settings
 xcuserdata/
+DerivedData/
+.DS_Store
+__pycache__/
+*.pyc
 
 ## Obj-C/Swift specific
 *.hmap
