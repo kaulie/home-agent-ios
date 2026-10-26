@@ -2,11 +2,14 @@ import Foundation
 import Network
 
 /// Two persisted Brain slots (LAN / Cloud) plus helpers to turn a base into `/api/v1/intent`.
-/// Fresh-install defaults come from `config/endpoints.json` via `python3 tools/sync_endpoints.py`.
+/// Fresh installs use `defaultCloudBase`. An update keeps UserDefaults, so a slot still
+/// pointing at `retiredCloudHost` is rewritten to `defaultCloudBase` on read.
 enum BrainEndpoint {
     /// LAN identity (settings). HTTP uses `lanResolvedBaseURL` (IPv4 from mDNS/probe).
     static let defaultLanBase = "http://brain.local:9527"
     static let defaultCloudBase = "http://49.234.45.173:9527"
+    /// Previous cloud Brain. Saved on devices before the host moved.
+    static let retiredCloudHost = "115.190.153.53"
 
     static let defaultLanIntentURL = intentURL(from: defaultLanBase)
     static let defaultCloudIntentURL = intentURL(from: defaultCloudBase)
@@ -82,8 +85,20 @@ enum BrainEndpoint {
     }
 
     static var cloudBaseURL: String {
-        get { stored(key: cloudKey, fallback: defaultCloudBase) }
+        get {
+            migrateRetiredCloudHostIfNeeded()
+            return stored(key: cloudKey, fallback: defaultCloudBase)
+        }
         set { UserDefaults.standard.set(normalizeBase(newValue), forKey: cloudKey) }
+    }
+
+    /// Cover installs keep `livingroom.brain.cloudURL`. If that slot is still the
+    /// retired host, point it at the current cloud Brain. Any other saved URL stays.
+    static func migrateRetiredCloudHostIfNeeded() {
+        let saved = UserDefaults.standard.string(forKey: cloudKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !saved.isEmpty, ipv4Host(from: saved) == retiredCloudHost else { return }
+        UserDefaults.standard.set(defaultCloudBase, forKey: cloudKey)
     }
 
     /// URL actually used to talk to LAN Brain. Empty until an IPv4 is discovered — never `brain.local`.
