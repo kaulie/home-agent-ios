@@ -1573,51 +1573,46 @@ final class AppModel: ObservableObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
+        // Show the user bubble immediately. ContentView already cleared the composer;
+        // previously resolve/register/heartbeat ran first, so the instruction vanished
+        // for seconds before appearing in the thread (user feedback intent #848).
+        let turnId = UUID()
+        let t0 = Date()
+        var pendingJourney = IntentJourney.make(jobId: "pending…", text: trimmed, status: .uploaded)
+        pendingJourney.clientStartedAt = t0
+        turns.append(
+            ChatTurn(
+                id: turnId,
+                intentId: "",
+                createdAt: t0,
+                userText: trimmed,
+                source: source,
+                journey: pendingJourney,
+                assistantText: nil,
+                awaitingTerminal: true,
+                inputAssetId: previewAssetId
+            )
+        )
+        persistTurns()
+        sending = true
+        defer { sending = false }
+
         await resolveBrainEndpoint(reregister: true)
         let serverURL = intentServerURL
         intentClient.lastServerURL = serverURL
         await ensureRegistered(serverURL: serverURL)
         let beatOk = await heartbeatNow(serverURL: serverURL)
         guard beatOk else {
-            let turnId = UUID()
-            turns.append(
-                ChatTurn(
-                    id: turnId,
-                    intentId: "",
-                    createdAt: Date(),
-                    userText: trimmed,
-                    source: source,
-                    journey: IntentJourneyStore.dispatchFailed(
-                        text: trimmed,
-                        detail: "心跳失败，未发出。请确认 Brain 可达后重试。"
-                    ),
-                    assistantText: "心跳失败，未发出。请确认 Brain 可达后重试。",
-                    awaitingTerminal: false,
-                    inputAssetId: previewAssetId
-                )
+            applyJourney(
+                IntentJourneyStore.dispatchFailed(
+                    text: trimmed,
+                    detail: "心跳失败，未发出。请确认 Brain 可达后重试。"
+                ),
+                to: turnId,
+                finished: true
             )
-            persistTurns()
             return
         }
-
-        let turnId = UUID()
-        let t0 = Date()
-        var pendingJourney = IntentJourney.make(jobId: "pending…", text: trimmed, status: .uploaded)
-        pendingJourney.clientStartedAt = t0
-        let turn = ChatTurn(
-            id: turnId,
-            intentId: "",
-            createdAt: t0,
-            userText: trimmed,
-            source: source,
-            journey: pendingJourney,
-            assistantText: nil,
-            awaitingTerminal: true,
-            inputAssetId: previewAssetId
-        )
-        turns.append(turn)
-        sending = true
-        defer { sending = false }
 
         let result = await intentClient.dispatch(
             text: trimmed,
