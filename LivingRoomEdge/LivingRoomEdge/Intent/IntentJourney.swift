@@ -1,7 +1,11 @@
 import Foundation
 import Combine
 
-/// Wire statuses for intent logistics job (must match server).
+/// Wire statuses for intent logistics job (must match Brain).
+///
+/// Current Brain / Mac Edge path (after single-hop dispatch):
+/// `intent_received` → `intent_parsed` → `intent_dispatched` → `running` → terminal.
+/// `intent_scheduled` is legacy/compatible only — shown when present in `status_log`.
 enum IntentPhase: String, CaseIterable, Equatable {
     case uploaded = "intent_received"
     case intentParsed = "intent_parsed"
@@ -11,10 +15,20 @@ enum IntentPhase: String, CaseIterable, Equatable {
     case succeeded
     case failed
 
-    /// Display steps (terminal success/failure share the last slot).
+    /// Default logistics rows (Brain current path). Scheduled is inserted only when observed.
     static let timelineOrder: [IntentPhase] = [
-        .uploaded, .intentParsed, .scheduled, .assigned, .running, .succeeded,
+        .uploaded, .intentParsed, .assigned, .running, .succeeded,
     ]
+
+    /// Build display order; include legacy `intent_scheduled` only if Brain stamped it.
+    static func timelineOrder(observed: Set<IntentPhase>) -> [IntentPhase] {
+        guard observed.contains(.scheduled) else { return timelineOrder }
+        var rows = timelineOrder
+        if let parsedIdx = rows.firstIndex(of: .intentParsed) {
+            rows.insert(.scheduled, at: parsedIdx + 1)
+        }
+        return rows
+    }
 
     var label: String { displayLabel(visual: .done) }
 
@@ -26,11 +40,13 @@ enum IntentPhase: String, CaseIterable, Equatable {
             return "已到达服务器"
         case .intentParsed:
             let waitingForParse = visual == .active && (reportedWire == nil || reportedWire == .uploaded)
-            return waitingForParse
-                ? "意图解析中"
-                : "意图解析完成，待下发到中控节点"
-        case .scheduled: return "任务已调度（intent_scheduled）"
-        case .assigned: return "任务已分发到执行节点（intent_dispatched）"
+            return waitingForParse ? "意图解析中" : "意图解析完成"
+        case .scheduled:
+            return "任务已调度（兼容 intent_scheduled）"
+        case .assigned:
+            let waitingDispatch = visual == .active
+                && (reportedWire == .intentParsed || reportedWire == .scheduled)
+            return waitingDispatch ? "正在下发到中控" : "已下发到中控"
         case .running: return "任务执行中"
         case .succeeded: return "任务执行完成（成功）"
         case .failed: return "任务执行完成（失败）"
@@ -1382,6 +1398,7 @@ struct IntentJourney: Equatable {
             }
             return map
         }()
+        let observedPhases = Set(steps.map(\.status))
         let serverAts = steps.compactMap(\.at).sorted()
         if let first = serverAts.first {
             serverStartedAt = first
@@ -1404,6 +1421,8 @@ struct IntentJourney: Equatable {
         // status_log `intent_received` / createdAt is acceptance (end of upload), not t0.
         let acceptedStamp = self.acceptedAt
         let uploadStart = clientStartedAt ?? previousAt[.uploaded] ?? acceptedStamp
+        // status_log `intent_parsed` is parse *end* (Brain stamp).
+        let parseEndedAt = atByPhase[.intentParsed] ?? previousAt[.intentParsed]
 
         let curRank: Int = {
             if displayStatus == .failed, let failAnchor {
@@ -1411,14 +1430,23 @@ struct IntentJourney: Equatable {
             }
             return displayStatus.rank
         }()
+        let maxObservedRank = observedPhases.map(\.rank).max() ?? displayStatus.rank
 
-        phases = IntentPhase.timelineOrder.map { phase in
+        let order = IntentPhase.timelineOrder(observed: observedPhases)
+        phases = order.map { phase in
+            let observed = observedPhases.contains(phase)
+                || phase == .uploaded
+                || phase == .intentParsed && (acceptedStamp != nil || parseEndedAt != nil)
+                || phase == .succeeded && displayStatus.isTerminal
+
             let visual: IntentPhaseVisualState
             if displayStatus == .failed {
-                if phase.rank < curRank {
-                    visual = .done
-                } else if phase.rank == curRank || phase == .succeeded {
+                if phase == .succeeded || phase.rank == curRank {
                     visual = .failed
+                } else if phase.rank < curRank {
+                    // Reached or skipped before terminal. Unobserved hops stay "done"
+                    // but must not invent timestamps (intent #844 billed 18s onto parse).
+                    visual = .done
                 } else {
                     visual = .pending
                 }
@@ -1437,9 +1465,14 @@ struct IntentJourney: Equatable {
             if phase == .assigned, let edgeNodeId, !edgeNodeId.isEmpty, detail.isEmpty {
                 detail = "node: \(edgeNodeId)"
             }
-            // Mark completed prior steps with a light default so the timeline reads as a path.
             if visual == .done, detail.isEmpty {
-                detail = "已完成"
+                if observed || phase.rank <= maxObservedRank {
+                    detail = observed || phase == .uploaded || phase == .intentParsed
+                        ? "已完成"
+                        : "未记录（已跳过）"
+                } else {
+                    detail = "已完成"
+                }
             }
             let at: Date? = {
                 switch phase {
@@ -1447,7 +1480,7 @@ struct IntentJourney: Equatable {
                     return uploadStart
                 case .intentParsed:
                     if visual == .pending { return nil }
-                    // Start of parse = accept time. status_log `intent_parsed` is parse *end*.
+                    // Start of parse = accept time. Duration uses parseEndedAt separately.
                     return acceptedStamp ?? previousAt[.intentParsed]
                 default:
                     break
@@ -1457,16 +1490,15 @@ struct IntentJourney: Equatable {
                 // Terminal failure slot: use serverFinishedAt, never wall-clock now.
                 if visual == .failed, let end = serverFinishedAt { return end }
                 if let t = previousAt[phase] { return t }
-                // Only stamp local now while still running and server has no stamp for this phase.
                 switch visual {
                 case .active, .timedOut:
                     return now
-                case .done, .failed:
-                    // Prefer server end for any reached phase missing its own stamp.
-                    if displayStatus.isTerminal {
-                        return serverFinishedAt ?? serverStartedAt
-                    }
-                    return now
+                case .done:
+                    // Missing intermediate stamp (e.g. dispatched dropped): do NOT
+                    // borrow failed/server end — that inflates the previous row.
+                    return nil
+                case .failed:
+                    return serverFinishedAt
                 case .pending:
                     return nil
                 }
@@ -1479,14 +1511,21 @@ struct IntentJourney: Equatable {
                 durationSeconds: nil
             )
         }
-        Self.fillPhaseDurations(&phases, now: now, serverEnd: serverFinishedAt)
+        Self.fillPhaseDurations(
+            &phases,
+            now: now,
+            serverEnd: serverFinishedAt,
+            parseEndedAt: parseEndedAt
+        )
     }
 
-    /// Done/failed: time until next stamped phase (else freeze at server end / `now`). Active: snapshot.
+    /// Done/failed: time until next *real* stamp (else freeze at server end / `now`).
+    /// Parse row is special: duration = parse_end − accept, never stretches to failed.
     private static func fillPhaseDurations(
         _ phases: inout [IntentPhaseState],
         now: Date,
-        serverEnd: Date?
+        serverEnd: Date?,
+        parseEndedAt: Date? = nil
     ) {
         for i in phases.indices {
             guard let start = phases[i].at else {
@@ -1499,8 +1538,12 @@ struct IntentJourney: Equatable {
             case .active, .timedOut:
                 phases[i].durationSeconds = max(0, now.timeIntervalSince(start))
             case .done, .failed:
-                // Next phase's start (frozen). Do not use wall-clock `now` —
-                // that would bill parse wait onto the previous (upload) row.
+                if phases[i].phase == .intentParsed, let parseEnd = parseEndedAt {
+                    phases[i].durationSeconds = max(0, parseEnd.timeIntervalSince(start))
+                    continue
+                }
+                // Next phase that actually has a stamp. Skip nil placeholders so a
+                // missing dispatched/running does not pull duration out to failed.
                 let nextAt = phases.dropFirst(i + 1).compactMap(\.at).first
                     ?? serverEnd
                 if let nextAt {

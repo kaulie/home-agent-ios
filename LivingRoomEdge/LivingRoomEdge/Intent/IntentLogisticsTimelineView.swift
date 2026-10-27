@@ -194,7 +194,7 @@ struct IntentLogisticsTimelineView: View {
         {
             return "失败"
         }
-        if journey.current.rank >= IntentPhase.scheduled.rank {
+        if journey.current.rank >= IntentPhase.assigned.rank {
             // Logistics label only: means intent was dispatched but this capability
             // has not yet reported step_status=1 / local .running.
             return "排队"
